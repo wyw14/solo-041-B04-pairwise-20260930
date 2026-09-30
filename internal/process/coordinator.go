@@ -171,13 +171,14 @@ func NewPlant(dataDir string, lines []model.LineID, now func() time.Time) (*Plan
 
 func (p *Plant) StartBatch(ctx context.Context, lineID model.LineID, flow float64, source string) (model.Batch, error) {
 	now := p.now()
-	if _, err := p.intake.Admit(ctx, lineID, flow, source, now); err != nil {
-		return model.Batch{}, err
-	}
 	p.mu.Lock()
 	if existingID, ok := p.lineBatches[lineID]; ok && p.batches[existingID].IsActive() {
 		p.mu.Unlock()
 		return model.Batch{}, errors.New("process line already has an active batch")
+	}
+	if _, err := p.intake.Admit(ctx, lineID, flow, source, now); err != nil {
+		p.mu.Unlock()
+		return model.Batch{}, err
 	}
 	batch := model.NewBatch(lineID, now)
 	p.batches[batch.ID] = batch
