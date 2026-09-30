@@ -74,3 +74,13 @@ func (c *Controller) Current(lineID model.LineID) (Admission, bool) {
 	value, ok := c.admissions[lineID]
 	return value, ok
 }
+
+// Release withdraws a line's admission and frees its equalizer. It is used when
+// a batch start that already reserved intake capacity fails to commit, so that
+// a failed request leaves no admission and no pool occupancy behind.
+func (c *Controller) Release(lineID model.LineID) {
+	c.mu.Lock()
+	delete(c.admissions, lineID)
+	c.mu.Unlock()
+	c.equalizers.Release(lineID)
+}

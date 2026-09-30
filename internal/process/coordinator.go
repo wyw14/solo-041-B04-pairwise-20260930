@@ -170,31 +170,56 @@ func NewPlant(dataDir string, lines []model.LineID, now func() time.Time) (*Plan
 }
 
 func (p *Plant) StartBatch(ctx context.Context, lineID model.LineID, flow float64, source string) (model.Batch, error) {
-	now := p.now()
-	if _, err := p.intake.Admit(ctx, lineID, flow, source, now); err != nil {
+	if err := ctx.Err(); err != nil {
 		return model.Batch{}, err
 	}
+	now := p.now()
+
+	// The uniqueness gate and the equalizer allocation happen in one critical
+	// section, before anything is journaled. A request that loses the gate must
+	// return without touching the existing batch's intake admission, equalizer
+	// occupancy or journal, and concurrent requests can therefore only admit a
+	// single batch.
 	p.mu.Lock()
 	if existingID, ok := p.lineBatches[lineID]; ok && p.batches[existingID].IsActive() {
 		p.mu.Unlock()
 		return model.Batch{}, errors.New("process line already has an active batch")
 	}
+	if _, err := p.intake.Admit(ctx, lineID, flow, source, now); err != nil {
+		p.mu.Unlock()
+		return model.Batch{}, err
+	}
+	priorState := p.lines[lineID]
 	batch := model.NewBatch(lineID, now)
 	p.batches[batch.ID] = batch
 	p.lineBatches[lineID] = batch.ID
-	state := p.lines[lineID]
+	state := priorState
 	state.BatchID = batch.ID.String()
 	state.UpdatedAt = now.UTC()
 	p.lines[lineID] = state
 	p.mu.Unlock()
+
 	event, err := model.NewEvent(lineID, batch.Generation, model.EventBatchCreated, batch, now)
 	if err != nil {
+		p.discardBatchStart(lineID, batch, priorState)
 		return model.Batch{}, err
 	}
 	if _, err := p.store.Append(ctx, event); err != nil {
+		p.discardBatchStart(lineID, batch, priorState)
 		return model.Batch{}, err
 	}
 	return batch, nil
+}
+
+// discardBatchStart rolls back a batch reservation that could not be committed
+// to the journal, restoring the line state, batch index and equalizer.
+func (p *Plant) discardBatchStart(lineID model.LineID, batch model.Batch, priorState model.LineState) {
+	p.mu.Lock()
+	delete(p.batches, batch.ID)
+	delete(p.lineBatches, lineID)
+	p.lines[lineID] = priorState
+	p.mu.Unlock()
+	p.intake.Release(lineID)
 }
 
 func (p *Plant) AdvanceBatch(ctx context.Context, lineID model.LineID, next model.ProcessStage) (model.Batch, error) {
